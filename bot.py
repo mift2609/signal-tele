@@ -5,6 +5,7 @@ import os
 import uuid
 
 import MetaTrader5 as mt5
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -29,6 +30,16 @@ ALLOW_REAL = os.getenv("ALLOW_REAL", "0") == "1"  # default: eksekusi hanya di a
 EXEC_ENABLED = bool(ALLOWED)
 MAGIC = 20261020
 
+# Sinyal BUY/SELL hanya keluar kalau skor konfluensi >= MIN_SCORE. Target reward:risk = RR.
+MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
+RR = float(os.getenv("RR", "2.0"))
+
+# Backtest: jumlah candle yang diuji dan batas lama posisi (dalam candle) sebelum ditutup paksa
+BT_BARS = int(os.getenv("BT_BARS", "2000"))
+BT_MAX_HOLD = int(os.getenv("BT_MAX_HOLD", "100"))
+TF_MIN = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "1h": 60, "4h": 240, "1day": 1440}
+HTF_MIN = {"1min": 15, "5min": 60, "15min": 240, "30min": 240, "1h": 240, "4h": 1440, "1day": 10080}
+
 # Pair yang muncul di /menu (bisa diubah lewat MENU_PAIRS di .env, dipisah koma)
 MENU_PAIRS = [p.strip().upper() for p in os.getenv("MENU_PAIRS", "XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD").split(",") if p.strip()]
 MENU_TFS = ["5min", "15min", "30min", "1h", "4h"]
@@ -44,14 +55,22 @@ TF_MAP = {
     "4h": mt5.TIMEFRAME_H4,
     "1day": mt5.TIMEFRAME_D1,
 }
+# Timeframe yang lebih besar untuk konfirmasi arah tren (higher timeframe)
+HTF_MAP = {
+    "1min": ("15min", mt5.TIMEFRAME_M15),
+    "5min": ("1h", mt5.TIMEFRAME_H1),
+    "15min": ("4h", mt5.TIMEFRAME_H4),
+    "30min": ("4h", mt5.TIMEFRAME_H4),
+    "1h": ("4h", mt5.TIMEFRAME_H4),
+    "4h": ("1day", mt5.TIMEFRAME_D1),
+    "1day": ("1minggu", mt5.TIMEFRAME_W1),
+}
 TF_ALIAS = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "60m": "1h", "1d": "1day", "d1": "1day", "h1": "1h", "h4": "4h"}
 
-SYSTEM_PROMPT = (
-    "Kamu analis teknikal forex. Berdasarkan data candle dan indikator yang diberikan, "
-    "beri sinyal. Balas HANYA JSON valid dengan kunci: "
-    '"arah" (BUY/SELL/WAIT), "entry", "stop_loss", "take_profit" (angka), '
-    '"keyakinan" (0-100), "alasan" (maks 3 kalimat, Bahasa Indonesia). '
-    "Jika kondisi tidak jelas, arah=WAIT dan level null. Rasio risk:reward minimal 1:1.5."
+EXPLAIN_PROMPT = (
+    "Kamu analis forex profesional. Tulis penjelasan singkat (maksimal 3 kalimat, Bahasa Indonesia, "
+    "tanpa markdown) atas keputusan sistem berikut. JANGAN mengubah keputusan, arah, atau angka. "
+    "Sebutkan satu risiko utama."
 )
 
 
@@ -80,29 +99,232 @@ def resolve_symbol(pair: str) -> str:
     return sym
 
 
-def get_candles(pair: str, tf: str) -> pd.DataFrame:
-    sym = resolve_symbol(pair)
-    rates = mt5.copy_rates_from_pos(sym, TF_MAP[tf], 0, 120)
-    if rates is None or len(rates) < 60:
-        raise ValueError("Data candle tidak tersedia")
+def rates_df(sym: str, tf_const, n: int, min_len: int) -> pd.DataFrame:
+    rates = mt5.copy_rates_from_pos(sym, tf_const, 0, n)
+    if rates is None or len(rates) < min_len:
+        raise ValueError(
+            f"Data candle belum cukup (butuh minimal {min_len}). Buka grafik {sym} di MT5 dulu agar riwayat terunduh."
+        )
     df = pd.DataFrame(rates)
     df["datetime"] = pd.to_datetime(df["time"], unit="s")
-    return df
+    return df.iloc[:-1].reset_index(drop=True)  # buang candle yang masih berjalan, pakai candle tertutup saja
 
 
+def collect_market_data(pair: str, tf: str) -> dict:
+    sym = resolve_symbol(pair)
+    info = mt5.symbol_info(sym)
+    tick = mt5.symbol_info_tick(sym)
+    df = rates_df(sym, TF_MAP[tf], 300, 120)
+    htf_name, htf_const = HTF_MAP[tf]
+    hdf = rates_df(sym, htf_const, 300, 60)
+    if tick is not None and tick.ask and tick.bid:
+        ask, bid = float(tick.ask), float(tick.bid)
+    else:
+        ask = bid = float(df["close"].iloc[-1])
+    digits = int(info.digits) if info is not None else 5
+    return {"df": df, "htf": hdf, "htf_name": htf_name, "ask": ask, "bid": bid, "digits": digits}
+
+
+# ---------- Mesin analisis (murni perhitungan, tanpa AI) ----------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    df["rsi"] = 100 - 100 / (1 + gain / loss)
+    c = df["close"]
+    df["ema20"] = c.ewm(span=20, adjust=False).mean()
+    df["ema50"] = c.ewm(span=50, adjust=False).mean()
+    df["ema200"] = c.ewm(span=200, adjust=False).mean()
+    delta = c.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.where(loss != 0)
+    df["rsi"] = (100 - 100 / (1 + rs)).fillna(50)
     tr = pd.concat(
-        [df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(), (df["low"] - df["close"].shift()).abs()],
+        [df["high"] - df["low"], (df["high"] - c.shift()).abs(), (df["low"] - c.shift()).abs()],
         axis=1,
     ).max(axis=1)
-    df["atr"] = tr.rolling(14).mean()
+    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    df["hist"] = macd - macd.ewm(span=9, adjust=False).mean()
     return df
+
+
+def htf_bias(h: pd.DataFrame) -> str:
+    h = add_indicators(h.copy())
+    close = float(h["close"].iloc[-1])
+    e50 = float(h["ema50"].iloc[-1])
+    e200 = float(h["ema200"].iloc[-1])
+    slope = float(h["ema50"].iloc[-1] - h["ema50"].iloc[-6])
+    if close > e50 > e200 and slope > 0:
+        return "BULL"
+    if close < e50 < e200 and slope < 0:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def swing_levels(df: pd.DataFrame, k: int = 2, lookback: int = 120):
+    d = df.tail(lookback)
+    hi = d["high"].to_numpy()
+    lo = d["low"].to_numpy()
+    highs, lows = [], []
+    for i in range(k, len(d) - k):
+        if all(hi[i] > hi[i - j] and hi[i] >= hi[i + j] for j in range(1, k + 1)):
+            highs.append(float(hi[i]))
+        if all(lo[i] < lo[i - j] and lo[i] <= lo[i + j] for j in range(1, k + 1)):
+            lows.append(float(lo[i]))
+    return highs, lows
+
+
+def evaluate(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, ask: float, bid: float, digits: int) -> dict:
+    """Hitung skor konfluensi (0-100) untuk BUY dan SELL, lalu pilih yang terbaik."""
+    d = add_indicators(df.copy())
+    last, prev = d.iloc[-1], d.iloc[-2]
+    atr = float(last["atr"])
+    if not atr > 0:
+        raise ValueError("ATR tidak valid (data harga datar)")
+    rsi = float(last["rsi"])
+    e20, e50, e200 = float(last["ema20"]), float(last["ema50"]), float(last["ema200"])
+    hist, hist_prev = float(last["hist"]), float(prev["hist"])
+    bias = htf_bias(hdf)
+    mid = (ask + bid) / 2
+    spread = ask - bid
+    highs, lows = swing_levels(d)
+
+    results = {}
+    for side in ("BUY", "SELL"):
+        buy = side == "BUY"
+        sgn = 1 if buy else -1
+        entry = ask if buy else bid
+        f = []
+
+        # 1) Arah tren timeframe besar
+        want = "BULL" if buy else "BEAR"
+        f.append((f"Tren HTF {htf_name}", 25 if bias == want else (8 if bias == "NEUTRAL" else 0), 25))
+
+        # 2) Susunan EMA 20/50/200
+        full = (e20 > e50 > e200) if buy else (e20 < e50 < e200)
+        half = (e20 > e50) if buy else (e20 < e50)
+        f.append(("Tren EMA", 20 if full else (10 if half else 0), 20))
+
+        # 3) Momentum MACD
+        h_s, hp_s = hist * sgn, hist_prev * sgn
+        f.append(("MACD", 10 if (h_s > 0 and h_s > hp_s) else (5 if h_s > 0 else 0), 10))
+
+        # 4) RSI (hindari overbought/oversold)
+        if buy:
+            p = 10 if 45 <= rsi <= 65 else (5 if 65 < rsi <= 70 else 0)
+        else:
+            p = 10 if 35 <= rsi <= 55 else (5 if 30 <= rsi < 35 else 0)
+        f.append(("RSI", p, 10))
+
+        # 5) Lokasi entry: dekat EMA20 (pullback), bukan mengejar harga
+        right_side = (mid > e50) if buy else (mid < e50)
+        dist = abs(mid - e20) / atr
+        p = (15 if dist <= 0.5 else (8 if dist <= 1.0 else 0)) if right_side else 0
+        f.append(("Posisi entry", p, 15))
+
+        # Level: SL di bawah/atas swing terdekat (atau 1.5 ATR), TP = RR x risiko
+        risk = 1.5 * atr
+        if buy:
+            below = [x for x in lows if x < entry]
+            if below:
+                s_sl = max(below) - 0.25 * atr
+                if atr <= entry - s_sl <= 3.0 * atr:
+                    risk = entry - s_sl
+        else:
+            above = [x for x in highs if x > entry]
+            if above:
+                s_sl = min(above) + 0.25 * atr
+                if atr <= s_sl - entry <= 3.0 * atr:
+                    risk = s_sl - entry
+        sl = entry - sgn * risk
+        tp = entry + sgn * RR * risk
+
+        # 6) Ruang menuju TP: tidak boleh terhalang support/resistance terdekat
+        if buy:
+            opp = [x for x in highs if x > entry + 0.1 * atr]
+            nearest = min(opp) if opp else None
+        else:
+            opp = [x for x in lows if x < entry - 0.1 * atr]
+            nearest = max(opp) if opp else None
+        room = 99.0 if nearest is None else abs(nearest - entry) / atr
+        need = RR * risk / atr
+        f.append(("Ruang S/R", 10 if room >= need else (4 if room >= 0.6 * need else 0), 10))
+
+        # 7) Spread terhadap volatilitas
+        ratio = spread / atr
+        f.append(("Spread", 10 if ratio <= 0.15 else (5 if ratio <= 0.3 else 0), 10))
+
+        results[side] = {"score": sum(p for _, p, _ in f), "factors": f, "entry": entry, "sl": sl, "tp": tp}
+
+    best = max(results, key=lambda k: results[k]["score"])
+    r = results[best]
+    blocks = []
+    if r["factors"][0][1] == 0:
+        blocks.append(f"melawan tren {htf_name}")
+    if r["factors"][3][1] == 0:
+        blocks.append("RSI di zona ekstrem")
+    if r["factors"][4][1] == 0:
+        blocks.append("harga sudah jauh dari EMA20 (mengejar harga)")
+    if r["factors"][6][1] == 0:
+        blocks.append("spread terlalu lebar")
+    if r["score"] < MIN_SCORE:
+        blocks.append(f"skor {r['score']} di bawah {MIN_SCORE}")
+    ok = not blocks
+    return {
+        "arah": best if ok else "WAIT",
+        "arah_terbaik": best,
+        "skor": r["score"],
+        "min_skor": MIN_SCORE,
+        "faktor": r["factors"],
+        "blokir": blocks,
+        "htf": htf_name,
+        "bias": bias,
+        "rsi": round(rsi, 1),
+        "atr": round(atr, digits),
+        "entry": round(r["entry"], digits) if ok else None,
+        "stop_loss": round(r["sl"], digits) if ok else None,
+        "take_profit": round(r["tp"], digits) if ok else None,
+    }
+
+
+def fallback_reason(s: dict) -> str:
+    kuat = [n for n, p, m in s["faktor"] if p == m]
+    lemah = [n for n, p, m in s["faktor"] if p == 0]
+    txt = f"Faktor kuat: {', '.join(kuat) or '-'}. Faktor lemah: {', '.join(lemah) or '-'}."
+    if s["blokir"]:
+        txt += " Ditahan karena " + "; ".join(s["blokir"]) + "."
+    return txt
+
+
+async def explain(pair: str, tf: str, s: dict) -> str:
+    """AI hanya menjelaskan keputusan, tidak menentukan arah atau level."""
+    fakta = "\n".join(f"- {n}: {p}/{m}" for n, p, m in s["faktor"])
+    ringkas = (
+        f"Pair {pair}, timeframe {tf}, HTF {s['htf']} bias {s['bias']}, RSI {s['rsi']}, ATR {s['atr']}.\n"
+        f"Keputusan sistem: {s['arah']} (arah terbaik {s['arah_terbaik']}, skor {s['skor']}/100, minimal {s['min_skor']}).\n"
+        f"Faktor skor:\n{fakta}\n"
+    )
+    if s["arah"] != "WAIT":
+        ringkas += f"Entry {s['entry']}, SL {s['stop_loss']}, TP {s['take_profit']}.\n"
+    if s["blokir"]:
+        ringkas += "Alasan WAIT: " + "; ".join(s["blokir"]) + "\n"
+    try:
+        resp = await ai.chat.completions.create(
+            model=MODEL,
+            max_tokens=300,
+            messages=[{"role": "system", "content": EXPLAIN_PROMPT}, {"role": "user", "content": ringkas}],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if text:
+            return text
+    except Exception:
+        logging.exception("penjelasan AI gagal, pakai penjelasan otomatis")
+    return fallback_reason(s)
+
+
+async def analyze(pair: str, tf: str) -> dict:
+    data = await run_sync(collect_market_data, pair, tf)
+    s = evaluate(data["df"], data["htf"], data["htf_name"], data["ask"], data["bid"], data["digits"])
+    s["alasan"] = await explain(pair, tf, s)
+    return s
 
 
 def valid_levels(s: dict) -> bool:
@@ -181,26 +403,146 @@ def account_text_sync() -> str:
     return text
 
 
-# ---------- AI ----------
-async def analyze(pair: str, interval: str) -> dict:
-    df = add_indicators(await run_sync(get_candles, pair, interval))
-    recent = df.tail(30)[["datetime", "open", "high", "low", "close", "ema20", "ema50", "rsi", "atr"]].round(5)
-    msg = f"Pair: {pair}, timeframe: {interval}\nData 30 candle terakhir:\n{recent.to_csv(index=False)}"
-    for _ in range(3):  # coba ulang kalau balasan AI bukan JSON yang valid
-        resp = await ai.chat.completions.create(
-            model=MODEL,
-            max_tokens=600,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}],
-        )
-        text = resp.choices[0].message.content or ""
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end != -1:
-            try:
-                return json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                pass
-    raise ValueError("AI tidak mengembalikan JSON setelah 3 percobaan, coba lagi sebentar lagi")
+# ---------- Backtest ----------
+def simulate_trade(buy, entry, sl, tp, spread, hi, lo, cl, i, max_hold):
+    """Simulasi posisi yang dibuka di akhir candle i.
+    Mengembalikan (hasil, indeks_keluar, R) atau None bila belum selesai sampai data habis.
+    Kalau SL dan TP tersentuh di candle yang sama, SL dianggap kena lebih dulu (konservatif)."""
+    n = len(cl)
+    risk = abs(entry - sl)
+    last_j = min(n - 1, i + max_hold)
+    for j in range(i + 1, last_j + 1):
+        if buy:  # BUY keluar di harga bid
+            hit_sl, hit_tp = lo[j] <= sl, hi[j] >= tp
+        else:  # SELL keluar di harga ask (= bid + spread)
+            hit_sl, hit_tp = hi[j] + spread >= sl, lo[j] + spread <= tp
+        if hit_sl:
+            return "SL", j, -1.0
+        if hit_tp:
+            return "TP", j, abs(tp - entry) / risk
+    if i + max_hold > n - 1:
+        return None
+    price = float(cl[last_j])
+    r = ((price - entry) if buy else (entry - (price + spread))) / risk
+    return "TIMEOUT", last_j, r
+
+
+def summarize_trades(trades: list) -> dict:
+    rs = [t["r"] for t in trades]
+    n = len(rs)
+    gross_win = sum(x for x in rs if x > 0)
+    gross_loss = -sum(x for x in rs if x <= 0)
+    eq = np.concatenate([[0.0], np.cumsum(rs)]) if n else np.array([0.0])
+    streak = best = 0
+    for x in rs:
+        streak = streak + 1 if x <= 0 else 0
+        best = max(best, streak)
+
+    def side_stat(side):
+        sub = [t["r"] for t in trades if t["side"] == side]
+        return len(sub), (100.0 * sum(1 for x in sub if x > 0) / len(sub) if sub else 0.0)
+
+    return {
+        "n": n,
+        "tp": sum(1 for t in trades if t["hasil"] == "TP"),
+        "sl": sum(1 for t in trades if t["hasil"] == "SL"),
+        "timeout": sum(1 for t in trades if t["hasil"] == "TIMEOUT"),
+        "win_rate": 100.0 * sum(1 for x in rs if x > 0) / n if n else 0.0,
+        "avg_r": float(np.mean(rs)) if n else 0.0,
+        "total_r": float(sum(rs)),
+        "pf": (gross_win / gross_loss) if gross_loss > 0 else None,
+        "max_dd": float((np.maximum.accumulate(eq) - eq).max()),
+        "max_streak": best,
+        "buy": side_stat("BUY"),
+        "sell": side_stat("SELL"),
+        "gross_win": gross_win,
+    }
+
+
+def run_backtest(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, tf: str, spread: float, digits: int,
+                 max_hold: int = 100, start: int = 299) -> dict:
+    """Jalankan aturan yang sama dengan sinyal live pada riwayat. Keputusan di candle i hanya memakai data sampai i."""
+    n = len(df)
+    tsec = TF_MIN[tf] * 60
+    hsec = HTF_MIN[tf] * 60
+    h_close = hdf["time"].to_numpy() + hsec  # waktu penutupan tiap candle HTF
+    hi = df["high"].to_numpy()
+    lo = df["low"].to_numpy()
+    cl = df["close"].to_numpy()
+    tm = df["time"].to_numpy()
+    trades = []
+    i = start
+    while i < n - 1:
+        k = int(np.searchsorted(h_close, tm[i] + tsec, side="right"))  # hanya candle HTF yang sudah tertutup
+        if k < 60:
+            i += 1
+            continue
+        price = float(cl[i])  # harga bid; ask = bid + spread
+        try:
+            s = evaluate(df.iloc[i - 299 : i + 1], hdf.iloc[max(0, k - 300) : k], htf_name, price + spread, price, digits)
+        except ValueError:
+            i += 1
+            continue
+        if s["arah"] == "WAIT":
+            i += 1
+            continue
+        buy = s["arah"] == "BUY"
+        res = simulate_trade(buy, s["entry"], s["stop_loss"], s["take_profit"], spread, hi, lo, cl, i, max_hold)
+        if res is None:
+            break
+        hasil, j, r = res
+        trades.append({"side": s["arah"], "i": i, "exit": j, "hasil": hasil, "r": r, "skor": s["skor"]})
+        i = j
+    out = summarize_trades(trades)
+    out["trades"] = trades
+    out["start"] = str(df["datetime"].iloc[start])[:10] if "datetime" in df.columns else ""
+    out["end"] = str(df["datetime"].iloc[-1])[:10] if "datetime" in df.columns else ""
+    out["bars"] = n - start
+    return out
+
+
+def backtest_sync(pair: str, tf: str, n_bars: int) -> dict:
+    sym = resolve_symbol(pair)
+    info = mt5.symbol_info(sym)
+    tick = mt5.symbol_info_tick(sym)
+    digits = int(info.digits) if info is not None else 5
+    spread = float(tick.ask - tick.bid) if tick is not None else 0.0
+    warm = 300
+    df = rates_df(sym, TF_MAP[tf], n_bars + warm, warm + 50)
+    htf_name, htf_const = HTF_MAP[tf]
+    need_h = int((n_bars + warm) * TF_MIN[tf] / HTF_MIN[tf]) + 320
+    hdf = rates_df(sym, htf_const, need_h, 100)
+    out = run_backtest(df, hdf, htf_name, tf, spread, digits, BT_MAX_HOLD)
+    out.update({"spread": spread, "htf_name": htf_name})
+    return out
+
+
+def format_backtest(pair: str, tf: str, r: dict) -> str:
+    be = 100.0 / (1.0 + RR)
+    lines = [
+        f"📈 Backtest {pair} ({tf}), HTF {r['htf_name']}",
+        f"Periode: {r['start']} s/d {r['end']} ({r['bars']} candle)",
+        f"Aturan: skor minimal {MIN_SCORE}, RR 1:{RR:g}, spread tetap {r['spread']:.5g}",
+        "",
+    ]
+    if r["n"] == 0:
+        lines += ["Tidak ada sinyal yang lolos pada periode ini.", "Coba timeframe lain atau tambah jumlah candle."]
+    else:
+        pf = f"{r['pf']:.2f}" if r["pf"] is not None else ("tak terhingga" if r["gross_win"] > 0 else "-")
+        lines += [
+            f"Total trade: {r['n']} (BUY {r['buy'][0]}, SELL {r['sell'][0]})",
+            f"TP: {r['tp']} | SL: {r['sl']} | Habis waktu: {r['timeout']}",
+            f"Win rate: {r['win_rate']:.1f}% (titik impas RR 1:{RR:g} = {be:.1f}%)",
+            f"Rata-rata: {r['avg_r']:+.2f}R per trade | Total: {r['total_r']:+.1f}R",
+            f"Profit factor: {pf}",
+            f"Drawdown maks: {r['max_dd']:.1f}R | Rugi beruntun maks: {r['max_streak']}",
+        ]
+        if r["n"] < 30:
+            lines += ["", f"⚠️ Baru {r['n']} trade: sampel terlalu kecil, hasilnya belum bisa dipercaya (idealnya 30+ trade)."]
+        elif r["avg_r"] <= 0:
+            lines += ["", "⚠️ Rata-rata hasil tidak positif: aturan ini belum terbukti menguntungkan di periode ini."]
+    lines += ["", "Catatan: tanpa komisi/swap/slippage; SL dianggap kena lebih dulu bila SL dan TP satu candle. Hasil lalu tidak menjamin masa depan."]
+    return "\n".join(lines)
 
 
 # ---------- Telegram ----------
@@ -229,10 +571,21 @@ def tf_keyboard(pair: str):
 
 
 def format_signal(pair: str, tf: str, s: dict) -> str:
-    lines = [f"📊 {pair} ({tf})", f"Arah: {s.get('arah')}"]
-    if s.get("arah") in ("BUY", "SELL"):
-        lines += [f"Entry: {s.get('entry')}", f"SL: {s.get('stop_loss')}", f"TP: {s.get('take_profit')}"]
-    lines += [f"Keyakinan: {s.get('keyakinan')}%", "", str(s.get("alasan", "")), "", "⚠️ Bukan saran keuangan."]
+    ikon = {"BUY": "🟢", "SELL": "🔴", "WAIT": "⏸"}[s["arah"]]
+    lines = [
+        f"📊 {pair} ({tf}) | HTF {s['htf']}: {s['bias']}",
+        f"Arah: {s['arah']} {ikon}",
+        f"Skor: {s['skor']}/100 ({s['arah_terbaik']}, minimal {s['min_skor']})",
+    ]
+    if s["arah"] != "WAIT":
+        lines += [f"Entry: {s['entry']}", f"SL: {s['stop_loss']}", f"TP: {s['take_profit']} (RR 1:{RR:g})"]
+    else:
+        lines.append("Ditahan: " + "; ".join(s["blokir"]))
+    lines.append("")
+    for n, p, m in s["faktor"]:
+        mark = "✅" if p == m else ("➖" if p > 0 else "❌")
+        lines.append(f"{mark} {n} {p}/{m}")
+    lines += ["", f"💬 {s['alasan']}", "", "⚠️ Skor = kekuatan konfluensi teknikal, bukan peluang menang. Bukan saran keuangan."]
     return "\n".join(lines)
 
 
@@ -260,6 +613,7 @@ async def do_signal(target, ctx: ContextTypes.DEFAULT_TYPE, pair: str, tf: str):
     nav = []
     if pair in MENU_PAIRS and tf in MENU_TFS:
         nav.append(InlineKeyboardButton("🔁 Ulangi", callback_data=f"m:{pair}:{tf}"))
+        nav.append(InlineKeyboardButton("📈 Backtest", callback_data=f"b:{pair}:{tf}"))
     nav.append(InlineKeyboardButton("📋 Menu", callback_data="menu"))
     rows.append(nav)
     await target.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
@@ -273,8 +627,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Bot sinyal forex (MT5).\n\n"
         "/menu - pilih pair dan timeframe lewat tombol\n"
         "/signal EURUSD [tf] - minta sinyal (tf: 1m, 5m, 15m, 30m, 1h, 4h, 1d)\n"
+        "/backtest XAUUSD 15m - uji win rate aturan ini pada riwayat broker\n"
         "/akun - info akun MT5\n"
         "/myid - lihat ID Telegram Anda\n\n"
+        f"Sinyal hanya keluar bila skor konfluensi minimal {MIN_SCORE}/100, selain itu WAIT.\n"
         f"{mode}\n"
         "Bukan saran keuangan. Selalu pakai manajemen risiko."
     )
@@ -297,6 +653,40 @@ async def akun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(await run_sync(account_text_sync), reply_markup=MENU_ONLY)
     except Exception as e:
         await update.message.reply_text(f"Gagal: {e}")
+
+
+async def run_backtest_message(target, ctx, pair: str, tf: str, bars: int):
+    if ctx.bot_data.get("bt_busy"):
+        await target.edit_text("⏳ Backtest lain masih berjalan, tunggu sebentar.", reply_markup=MENU_ONLY)
+        return
+    ctx.bot_data["bt_busy"] = True
+    try:
+        text = format_backtest(pair, tf, await run_sync(backtest_sync, pair, tf, bars))
+    except Exception as e:
+        logging.exception("backtest gagal")
+        text = f"Gagal: {e}"
+    finally:
+        ctx.bot_data["bt_busy"] = False
+    await target.edit_text(text, reply_markup=MENU_ONLY)
+
+
+async def backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    if not ctx.args:
+        await update.message.reply_text("Contoh: /backtest XAUUSD 15m\nTambah jumlah candle (500-5000): /backtest XAUUSD 15m 3000")
+        return
+    pair = normalize_pair(ctx.args[0])
+    tf = ctx.args[1].lower() if len(ctx.args) > 1 else DEFAULT_TF
+    tf = TF_ALIAS.get(tf, tf)
+    if tf not in TF_MAP:
+        await update.message.reply_text(f"Timeframe valid: {', '.join(TF_MAP)}")
+        return
+    bars = BT_BARS
+    if len(ctx.args) > 2 and ctx.args[2].isdigit():
+        bars = max(500, min(int(ctx.args[2]), 5000))
+    wait = await update.message.reply_text(f"📈 Backtest {pair} {tf} ({bars} candle) berjalan, bisa 1-2 menit...")
+    ctx.application.create_task(run_backtest_message(wait, ctx, pair, tf, bars))
 
 
 async def signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -337,6 +727,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"Menganalisis {parts[1]} {parts[2]}...")
             await do_signal(msg, ctx, parts[1], parts[2])
         return
+    if data.startswith("b:"):
+        parts = data.split(":")
+        if len(parts) == 3 and parts[1] in MENU_PAIRS and parts[2] in TF_MAP:
+            await msg.edit_text(f"📈 Backtest {parts[1]} {parts[2]} berjalan, bisa 1-2 menit...")
+            ctx.application.create_task(run_backtest_message(msg, ctx, parts[1], parts[2], BT_BARS))
+        return
     if data == "akun":
         try:
             text = await run_sync(account_text_sync)
@@ -372,6 +768,7 @@ async def post_init(app):
         [
             BotCommand("menu", "Pilih pair dan timeframe"),
             BotCommand("signal", "Minta sinyal, contoh: /signal XAUUSD 15m"),
+            BotCommand("backtest", "Uji win rate, contoh: /backtest XAUUSD 15m"),
             BotCommand("akun", "Info akun MT5"),
             BotCommand("myid", "Lihat ID Telegram Anda"),
             BotCommand("start", "Bantuan"),
@@ -386,6 +783,7 @@ def main():
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("akun", akun))
     app.add_handler(CommandHandler("signal", signal))
+    app.add_handler(CommandHandler("backtest", backtest))
     app.add_handler(CallbackQueryHandler(on_button))
     app.run_polling()
 
