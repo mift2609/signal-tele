@@ -22,7 +22,8 @@ ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.str
 
 ai = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 DEFAULT_TF = "1h"
-VALID_TF = {"15min", "30min", "1h", "4h", "1day"}
+VALID_TF = {"1min", "5min", "15min", "30min", "1h", "4h", "1day"}
+TF_ALIAS = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "60m": "1h", "1d": "1day", "d1": "1day", "h1": "1h", "h4": "4h"}
 
 SYSTEM_PROMPT = (
     "Kamu analis teknikal forex. Berdasarkan data candle dan indikator yang diberikan, "
@@ -75,12 +76,14 @@ async def analyze(symbol: str, interval: str) -> dict:
     resp = await ai.chat.completions.create(
         model=MODEL,
         max_tokens=600,
+        response_format={"type": "json_object"},
         messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}],
     )
-    text = resp.choices[0].message.content.strip().strip("`")
-    if text.lower().startswith("json"):
-        text = text[4:]
-    return json.loads(text)
+    text = resp.choices[0].message.content or ""
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("AI tidak mengembalikan JSON, coba kirim ulang perintahnya")
+    return json.loads(text[start : end + 1])
 
 
 def allowed(update: Update) -> bool:
@@ -92,7 +95,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Bot sinyal forex.\n\n"
-        "/signal EURUSD [tf] - minta sinyal (tf: 15min, 30min, 1h, 4h, 1day)\n"
+        "/signal EURUSD [tf] - minta sinyal (tf: 1m, 5m, 15m, 30m, 1h, 4h, 1d)\n"
         "/myid - lihat ID Telegram Anda\n\n"
         "Bukan saran keuangan. Selalu pakai manajemen risiko."
     )
@@ -110,6 +113,7 @@ async def signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     symbol = normalize_pair(ctx.args[0])
     tf = ctx.args[1].lower() if len(ctx.args) > 1 else DEFAULT_TF
+    tf = TF_ALIAS.get(tf, tf)
     if tf not in VALID_TF:
         await update.message.reply_text(f"Timeframe valid: {', '.join(sorted(VALID_TF))}")
         return
