@@ -4,7 +4,7 @@ import os
 
 import httpx
 import pandas as pd
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -13,13 +13,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+AI_API_KEY = os.environ["AI_API_KEY"]
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 TWELVEDATA_KEY = os.environ["TWELVEDATA_API_KEY"]
-MODEL = os.getenv("AI_MODEL", "claude-sonnet-5-5")
+MODEL = os.getenv("AI_MODEL", "qwen-plus")
 # Kosongkan = semua orang boleh pakai. Isi ID Telegram dipisah koma untuk membatasi.
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()}
 
-ai = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+ai = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 DEFAULT_TF = "1h"
 VALID_TF = {"15min", "30min", "1h", "4h", "1day"}
 
@@ -71,10 +72,12 @@ async def analyze(symbol: str, interval: str) -> dict:
     df = add_indicators(await fetch_candles(symbol, interval))
     recent = df.tail(30)[["datetime", "open", "high", "low", "close", "ema20", "ema50", "rsi", "atr"]].round(5)
     msg = f"Pair: {symbol}, timeframe: {interval}\nData 30 candle terakhir:\n{recent.to_csv(index=False)}"
-    resp = await ai.messages.create(
-        model=MODEL, max_tokens=600, system=SYSTEM_PROMPT, messages=[{"role": "user", "content": msg}]
+    resp = await ai.chat.completions.create(
+        model=MODEL,
+        max_tokens=600,
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}],
     )
-    text = resp.content[0].text.strip().strip("`")
+    text = resp.choices[0].message.content.strip().strip("`")
     if text.lower().startswith("json"):
         text = text[4:]
     return json.loads(text)
