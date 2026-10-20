@@ -31,12 +31,13 @@ EXEC_ENABLED = bool(ALLOWED)
 MAGIC = 20261020
 
 # Sinyal BUY/SELL hanya keluar kalau skor konfluensi >= MIN_SCORE. Target reward:risk = RR.
-MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "50"))
 RR = float(os.getenv("RR", "2.0"))
 
 # Backtest: jumlah candle yang diuji dan batas lama posisi (dalam candle) sebelum ditutup paksa
 BT_BARS = int(os.getenv("BT_BARS", "2000"))
 BT_MAX_HOLD = int(os.getenv("BT_MAX_HOLD", "100"))
+PENDING_BARS = int(os.getenv("PENDING_BARS", "12"))  # order LIMIT/STOP dianggap batal bila tak terisi dalam N candle
 TF_MIN = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "1h": 60, "4h": 240, "1day": 1440}
 HTF_MIN = {"1min": 15, "5min": 60, "15min": 240, "30min": 240, "1h": 240, "4h": 1440, "1day": 10080}
 
@@ -218,33 +219,49 @@ def evaluate(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, ask: float, bid
         right_side = (mid > e50) if buy else (mid < e50)
         dist = abs(mid - e20) / atr
         p = (15 if dist <= 0.5 else (8 if dist <= 1.0 else 0)) if right_side else 0
+
+        # Jenis order terbaik: MARKET (harga sudah bagus), LIMIT (tunggu pullback ke EMA20
+        # kalau harga sudah menjauh), STOP (tunggu tembus swing terdekat bila momentum kuat)
+        tipe, px = "MARKET", entry
+        pull_ok = (e20 < entry) if buy else (e20 > entry)
+        if p == 0 and right_side and pull_ok:
+            tipe, px, p = "LIMIT", e20, 8  # setup valid, tapi masuk di EMA20 bukan mengejar harga
         f.append(("Posisi entry", p, 15))
+        if tipe == "MARKET" and f[2][1] == 10:
+            if buy:
+                near = [x for x in highs if entry + 0.1 * atr <= x <= entry + 0.6 * atr]
+                if near:
+                    tipe, px = "STOP", min(near) + 0.1 * atr
+            else:
+                near = [x for x in lows if entry - 0.6 * atr <= x <= entry - 0.1 * atr]
+                if near:
+                    tipe, px = "STOP", max(near) - 0.1 * atr
 
         # Level: SL di bawah/atas swing terdekat (atau 1.5 ATR), TP = RR x risiko
         risk = 1.5 * atr
         if buy:
-            below = [x for x in lows if x < entry]
+            below = [x for x in lows if x < px]
             if below:
                 s_sl = max(below) - 0.25 * atr
-                if atr <= entry - s_sl <= 3.0 * atr:
-                    risk = entry - s_sl
+                if atr <= px - s_sl <= 3.0 * atr:
+                    risk = px - s_sl
         else:
-            above = [x for x in highs if x > entry]
+            above = [x for x in highs if x > px]
             if above:
                 s_sl = min(above) + 0.25 * atr
-                if atr <= s_sl - entry <= 3.0 * atr:
-                    risk = s_sl - entry
-        sl = entry - sgn * risk
-        tp = entry + sgn * RR * risk
+                if atr <= s_sl - px <= 3.0 * atr:
+                    risk = s_sl - px
+        sl = px - sgn * risk
+        tp = px + sgn * RR * risk
 
         # 6) Ruang menuju TP: tidak boleh terhalang support/resistance terdekat
         if buy:
-            opp = [x for x in highs if x > entry + 0.1 * atr]
+            opp = [x for x in highs if x > px + 0.1 * atr]
             nearest = min(opp) if opp else None
         else:
-            opp = [x for x in lows if x < entry - 0.1 * atr]
+            opp = [x for x in lows if x < px - 0.1 * atr]
             nearest = max(opp) if opp else None
-        room = 99.0 if nearest is None else abs(nearest - entry) / atr
+        room = 99.0 if nearest is None else abs(nearest - px) / atr
         need = RR * risk / atr
         f.append(("Ruang S/R", 10 if room >= need else (4 if room >= 0.6 * need else 0), 10))
 
@@ -252,7 +269,7 @@ def evaluate(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, ask: float, bid
         ratio = spread / atr
         f.append(("Spread", 10 if ratio <= 0.15 else (5 if ratio <= 0.3 else 0), 10))
 
-        results[side] = {"score": sum(p for _, p, _ in f), "factors": f, "entry": entry, "sl": sl, "tp": tp}
+        results[side] = {"score": sum(p for _, p, _ in f), "factors": f, "entry": px, "sl": sl, "tp": tp, "tipe": tipe, "now": entry}
 
     best = max(results, key=lambda k: results[k]["score"])
     r = results[best]
@@ -262,7 +279,7 @@ def evaluate(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, ask: float, bid
     if r["factors"][3][1] == 0:
         blocks.append("RSI di zona ekstrem")
     if r["factors"][4][1] == 0:
-        blocks.append("harga sudah jauh dari EMA20 (mengejar harga)")
+        blocks.append("posisi harga tidak ideal (sisi salah EMA50 / terlalu jauh dari EMA20)")
     if r["factors"][6][1] == 0:
         blocks.append("spread terlalu lebar")
     if r["score"] < MIN_SCORE:
@@ -270,6 +287,8 @@ def evaluate(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, ask: float, bid
     ok = not blocks
     return {
         "arah": best if ok else "WAIT",
+        "tipe": r["tipe"] if ok else None,
+        "harga_now": round(r["now"], digits),
         "arah_terbaik": best,
         "skor": r["score"],
         "min_skor": MIN_SCORE,
@@ -303,7 +322,7 @@ async def explain(pair: str, tf: str, s: dict) -> str:
         f"Faktor skor:\n{fakta}\n"
     )
     if s["arah"] != "WAIT":
-        ringkas += f"Entry {s['entry']}, SL {s['stop_loss']}, TP {s['take_profit']}.\n"
+        ringkas += f"Jenis order {s['tipe']}, entry {s['entry']} (harga kini {s['harga_now']}), SL {s['stop_loss']}, TP {s['take_profit']}.\n"
     if s["blokir"]:
         ringkas += "Alasan WAIT: " + "; ".join(s["blokir"]) + "\n"
     try:
@@ -344,8 +363,8 @@ def execute_order_sync(pair: str, s: dict):
         raise RuntimeError("Akun MT5 belum login")
     if acc.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO and not ALLOW_REAL:
         raise ValueError("Akun ini bukan DEMO, eksekusi diblokir (ALLOW_REAL=1 untuk mengizinkan).")
-    if len(mt5.positions_get() or ()) >= MAX_POSITIONS:
-        raise ValueError(f"Batas posisi terbuka ({MAX_POSITIONS}) tercapai")
+    if len(mt5.positions_get() or ()) + len(mt5.orders_get() or ()) >= MAX_POSITIONS:
+        raise ValueError(f"Batas posisi + order tertunda ({MAX_POSITIONS}) tercapai")
 
     sym = resolve_symbol(pair)
     info = mt5.symbol_info(sym)
@@ -355,10 +374,21 @@ def execute_order_sync(pair: str, s: dict):
 
     buy = s["arah"] == "BUY"
     price = tick.ask if buy else tick.bid
+    tipe = s.get("tipe") or "MARKET"
     sl, tp = float(s["stop_loss"]), float(s["take_profit"])
-    ok = (sl < price < tp) if buy else (tp < price < sl)
-    if not ok:
-        raise ValueError(f"SL/TP tidak sesuai harga saat ini ({price}). Minta sinyal baru.")
+    entry = float(s["entry"])
+    if tipe == "MARKET":
+        ok = (sl < price < tp) if buy else (tp < price < sl)
+        if not ok:
+            raise ValueError(f"SL/TP tidak sesuai harga saat ini ({price}). Minta sinyal baru.")
+    else:
+        # Order tertunda: harga pasang harus di sisi yang benar dan tidak terlalu dekat dengan harga sekarang
+        ok = (entry < price if buy else entry > price) if tipe == "LIMIT" else (entry > price if buy else entry < price)
+        if not ok:
+            raise ValueError(f"Harga {tipe} {entry} sudah terlewat (harga kini {price}). Minta sinyal baru.")
+        min_gap = (info.trade_stops_level or 0) * info.point
+        if abs(entry - price) < min_gap:
+            raise ValueError(f"Harga {tipe} terlalu dekat dengan harga kini (minimal jarak broker {min_gap}). Minta sinyal baru.")
 
     fm = info.filling_mode
     if fm & 1:
@@ -368,20 +398,41 @@ def execute_order_sync(pair: str, s: dict):
     else:
         filling = mt5.ORDER_FILLING_RETURN
 
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": sym,
-        "volume": max(LOT, info.volume_min),
-        "type": mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
-        "deviation": 20,
-        "magic": MAGIC,
-        "comment": "tele-signal-bot",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling,
-    }
+    if tipe == "MARKET":
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": sym,
+            "volume": max(LOT, info.volume_min),
+            "type": mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": 20,
+            "magic": MAGIC,
+            "comment": "tele-signal-bot",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling,
+        }
+    else:
+        otype = {
+            ("LIMIT", True): mt5.ORDER_TYPE_BUY_LIMIT,
+            ("LIMIT", False): mt5.ORDER_TYPE_SELL_LIMIT,
+            ("STOP", True): mt5.ORDER_TYPE_BUY_STOP,
+            ("STOP", False): mt5.ORDER_TYPE_SELL_STOP,
+        }[(tipe, buy)]
+        req = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": sym,
+            "volume": max(LOT, info.volume_min),
+            "type": otype,
+            "price": entry,
+            "sl": sl,
+            "tp": tp,
+            "magic": MAGIC,
+            "comment": "tele-signal-bot",
+            "type_time": mt5.ORDER_TIME_DAY,  # kedaluwarsa otomatis di akhir hari broker
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
     res = mt5.order_send(req)
     if res is None:
         raise RuntimeError(f"order_send gagal: {mt5.last_error()}")
@@ -471,6 +522,7 @@ def run_backtest(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, tf: str, sp
     cl = df["close"].to_numpy()
     tm = df["time"].to_numpy()
     trades = []
+    unfilled = 0
     i = start
     while i < n - 1:
         k = int(np.searchsorted(h_close, tm[i] + tsec, side="right"))  # hanya candle HTF yang sudah tertutup
@@ -487,14 +539,41 @@ def run_backtest(df: pd.DataFrame, hdf: pd.DataFrame, htf_name: str, tf: str, sp
             i += 1
             continue
         buy = s["arah"] == "BUY"
-        res = simulate_trade(buy, s["entry"], s["stop_loss"], s["take_profit"], spread, hi, lo, cl, i, max_hold)
+        tipe = s["tipe"]
+        start_i = i
+        if tipe != "MARKET":
+            # Order tertunda: tunggu terisi maksimal PENDING_BARS candle, kalau tidak terisi dibatalkan
+            ep = s["entry"]
+            fill = None
+            for j in range(i + 1, min(n, i + 1 + PENDING_BARS)):
+                if tipe == "LIMIT":
+                    hit = (lo[j] + spread <= ep) if buy else (hi[j] >= ep)
+                else:
+                    hit = (hi[j] + spread >= ep) if buy else (lo[j] <= ep)
+                if hit:
+                    fill = j
+                    break
+            if fill is None:
+                unfilled += 1
+                i += PENDING_BARS  # order kedaluwarsa dulu sebelum sinyal berikutnya dipakai
+                continue
+            sl_now = s["stop_loss"]
+            if (buy and lo[fill] <= sl_now) or ((not buy) and hi[fill] + spread >= sl_now):
+                res = ("SL", fill, -1.0)  # terisi dan kena SL di candle yang sama: anggap rugi
+            else:
+                res = simulate_trade(buy, ep, sl_now, s["take_profit"], spread, hi, lo, cl, fill, max_hold)
+            start_i = fill
+        else:
+            res = simulate_trade(buy, s["entry"], s["stop_loss"], s["take_profit"], spread, hi, lo, cl, i, max_hold)
         if res is None:
             break
         hasil, j, r = res
-        trades.append({"side": s["arah"], "i": i, "exit": j, "hasil": hasil, "r": r, "skor": s["skor"]})
+        trades.append({"side": s["arah"], "i": start_i, "exit": j, "hasil": hasil, "r": r, "skor": s["skor"], "tipe": tipe})
         i = j
     out = summarize_trades(trades)
     out["trades"] = trades
+    out["unfilled"] = unfilled
+    out["by_tipe"] = {k: sum(1 for t in trades if t["tipe"] == k) for k in ("MARKET", "LIMIT", "STOP")}
     out["start"] = str(df["datetime"].iloc[start])[:10] if "datetime" in df.columns else ""
     out["end"] = str(df["datetime"].iloc[-1])[:10] if "datetime" in df.columns else ""
     out["bars"] = n - start
@@ -531,6 +610,7 @@ def format_backtest(pair: str, tf: str, r: dict) -> str:
         pf = f"{r['pf']:.2f}" if r["pf"] is not None else ("tak terhingga" if r["gross_win"] > 0 else "-")
         lines += [
             f"Total trade: {r['n']} (BUY {r['buy'][0]}, SELL {r['sell'][0]})",
+            f"Jenis: market {r['by_tipe']['MARKET']}, limit {r['by_tipe']['LIMIT']}, stop {r['by_tipe']['STOP']} (tak terisi/batal: {r['unfilled']})",
             f"TP: {r['tp']} | SL: {r['sl']} | Habis waktu: {r['timeout']}",
             f"Win rate: {r['win_rate']:.1f}% (titik impas RR 1:{RR:g} = {be:.1f}%)",
             f"Rata-rata: {r['avg_r']:+.2f}R per trade | Total: {r['total_r']:+.1f}R",
@@ -578,7 +658,17 @@ def format_signal(pair: str, tf: str, s: dict) -> str:
         f"Skor: {s['skor']}/100 ({s['arah_terbaik']}, minimal {s['min_skor']})",
     ]
     if s["arah"] != "WAIT":
+        nama = {
+            "MARKET": "MARKET (langsung)",
+            "LIMIT": "LIMIT (tunggu pullback)",
+            "STOP": "STOP (tunggu tembus level)",
+        }[s["tipe"]]
+        lines += [f"Order: {s['arah']} {nama}"]
+        if s["tipe"] != "MARKET":
+            lines.append(f"Harga kini: {s['harga_now']}")
         lines += [f"Entry: {s['entry']}", f"SL: {s['stop_loss']}", f"TP: {s['take_profit']} (RR 1:{RR:g})"]
+        if s["tipe"] != "MARKET":
+            lines.append("Order tertunda, batal otomatis di akhir hari broker.")
     else:
         lines.append("Ditahan: " + "; ".join(s["blokir"]))
     lines.append("")
@@ -603,7 +693,7 @@ async def do_signal(target, ctx: ContextTypes.DEFAULT_TYPE, pair: str, tf: str):
             pending[key] = (pair, s)
             rows.append(
                 [
-                    InlineKeyboardButton(f"✅ Eksekusi {s['arah']} {LOT} lot", callback_data=f"x:{key}"),
+                    InlineKeyboardButton(f"✅ {s['arah']} {s['tipe']} {LOT} lot", callback_data=f"x:{key}"),
                     InlineKeyboardButton("❌ Batal", callback_data=f"c:{key}"),
                 ]
             )
@@ -756,7 +846,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(base + "\n\n⏳ Mengirim order...")
     try:
         res = await run_sync(execute_order_sync, *item)
-        await msg.edit_text(base + f"\n\n✅ Order terkirim. Tiket: {res.order}, harga: {res.price}", reply_markup=MENU_ONLY)
+        pend = (item[1].get("tipe") or "MARKET") != "MARKET"
+        info_txt = f"Order tertunda terpasang. Tiket: {res.order}" if pend else f"Order terkirim. Tiket: {res.order}, harga: {res.price}"
+        await msg.edit_text(base + f"\n\n✅ {info_txt}", reply_markup=MENU_ONLY)
     except Exception as e:
         logging.exception("order gagal")
         await msg.edit_text(base + f"\n\n❌ Order gagal: {e}", reply_markup=MENU_ONLY)
