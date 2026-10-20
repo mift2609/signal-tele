@@ -8,12 +8,13 @@ import MetaTrader5 as mt5
 import pandas as pd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
+# Semua rahasia dibaca dari file .env (JANGAN ditulis di dalam file ini, repo GitHub bersifat publik).
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 AI_API_KEY = os.environ["AI_API_KEY"]
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
@@ -23,10 +24,14 @@ ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.str
 
 LOT = float(os.getenv("LOT_SIZE", "0.01"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-SYMBOL_SUFFIX = os.getenv("SYMBOL_SUFFIX", "")  # contoh "m" kalau broker memakai EURUSDm
+SYMBOL_SUFFIX = os.getenv("SYMBOL_SUFFIX", "")  # contoh "-STDc" kalau simbol broker XAUUSD-STDc
 ALLOW_REAL = os.getenv("ALLOW_REAL", "0") == "1"  # default: eksekusi hanya di akun DEMO
 EXEC_ENABLED = bool(ALLOWED)
 MAGIC = 20261020
+
+# Pair yang muncul di /menu (bisa diubah lewat MENU_PAIRS di .env, dipisah koma)
+MENU_PAIRS = [p.strip().upper() for p in os.getenv("MENU_PAIRS", "XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD").split(",") if p.strip()]
+MENU_TFS = ["5min", "15min", "30min", "1h", "4h"]
 
 ai = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 DEFAULT_TF = "1h"
@@ -168,9 +173,12 @@ def account_text_sync() -> str:
     a = mt5.account_info()
     if a is None:
         raise RuntimeError("Akun MT5 belum login")
-    mode = "DEMO" if a.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else "REAL"
+    is_demo = a.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
     pos = len(mt5.positions_get() or ())
-    return f"Akun {a.login} ({mode})\nServer: {a.server}\nSaldo: {a.balance} {a.currency}\nEkuitas: {a.equity}\nPosisi terbuka: {pos}"
+    text = f"Akun {a.login} ({'DEMO' if is_demo else 'REAL'})\nServer: {a.server}\nSaldo: {a.balance} {a.currency}\nEkuitas: {a.equity}\nPosisi terbuka: {pos}"
+    if not is_demo and not ALLOW_REAL:
+        text += "\n\n🔒 Akun REAL: tombol eksekusi order diblokir (hanya sinyal)."
+    return text
 
 
 # ---------- AI ----------
@@ -178,22 +186,83 @@ async def analyze(pair: str, interval: str) -> dict:
     df = add_indicators(await run_sync(get_candles, pair, interval))
     recent = df.tail(30)[["datetime", "open", "high", "low", "close", "ema20", "ema50", "rsi", "atr"]].round(5)
     msg = f"Pair: {pair}, timeframe: {interval}\nData 30 candle terakhir:\n{recent.to_csv(index=False)}"
-    resp = await ai.chat.completions.create(
-        model=MODEL,
-        max_tokens=600,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}],
-    )
-    text = resp.choices[0].message.content or ""
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("AI tidak mengembalikan JSON, coba kirim ulang perintahnya")
-    return json.loads(text[start : end + 1])
+    for _ in range(3):  # coba ulang kalau balasan AI bukan JSON yang valid
+        resp = await ai.chat.completions.create(
+            model=MODEL,
+            max_tokens=600,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}],
+        )
+        text = resp.choices[0].message.content or ""
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end != -1:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+    raise ValueError("AI tidak mengembalikan JSON setelah 3 percobaan, coba lagi sebentar lagi")
 
 
 # ---------- Telegram ----------
 def allowed(update: Update) -> bool:
     return not ALLOWED or update.effective_user.id in ALLOWED
+
+
+MENU_TEXT = "📋 Menu\nPilih pair untuk minta sinyal:"
+MENU_ONLY = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="menu")]])
+
+
+def pair_keyboard():
+    rows = []
+    for i in range(0, len(MENU_PAIRS), 3):
+        rows.append([InlineKeyboardButton(p, callback_data=f"p:{p}") for p in MENU_PAIRS[i : i + 3]])
+    rows.append([InlineKeyboardButton("💼 Akun", callback_data="akun")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tf_keyboard(pair: str):
+    rows = []
+    for i in range(0, len(MENU_TFS), 3):
+        rows.append([InlineKeyboardButton(t, callback_data=f"m:{pair}:{t}") for t in MENU_TFS[i : i + 3]])
+    rows.append([InlineKeyboardButton("⬅️ Kembali", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_signal(pair: str, tf: str, s: dict) -> str:
+    lines = [f"📊 {pair} ({tf})", f"Arah: {s.get('arah')}"]
+    if s.get("arah") in ("BUY", "SELL"):
+        lines += [f"Entry: {s.get('entry')}", f"SL: {s.get('stop_loss')}", f"TP: {s.get('take_profit')}"]
+    lines += [f"Keyakinan: {s.get('keyakinan')}%", "", str(s.get("alasan", "")), "", "⚠️ Bukan saran keuangan."]
+    return "\n".join(lines)
+
+
+async def do_signal(target, ctx: ContextTypes.DEFAULT_TYPE, pair: str, tf: str):
+    """Analisis lalu ubah pesan `target` menjadi hasil sinyal (dengan tombol)."""
+    rows = []
+    try:
+        s = await analyze(pair, tf)
+        text = format_signal(pair, tf, s)
+        if EXEC_ENABLED and s.get("arah") in ("BUY", "SELL") and valid_levels(s):
+            key = uuid.uuid4().hex[:8]
+            pending = ctx.bot_data.setdefault("pending", {})
+            if len(pending) > 50:
+                pending.clear()
+            pending[key] = (pair, s)
+            rows.append(
+                [
+                    InlineKeyboardButton(f"✅ Eksekusi {s['arah']} {LOT} lot", callback_data=f"x:{key}"),
+                    InlineKeyboardButton("❌ Batal", callback_data=f"c:{key}"),
+                ]
+            )
+    except Exception as e:
+        logging.exception("gagal")
+        text = f"Gagal: {e}"
+    nav = []
+    if pair in MENU_PAIRS and tf in MENU_TFS:
+        nav.append(InlineKeyboardButton("🔁 Ulangi", callback_data=f"m:{pair}:{tf}"))
+    nav.append(InlineKeyboardButton("📋 Menu", callback_data="menu"))
+    rows.append(nav)
+    await target.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -202,12 +271,19 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = f"Eksekusi MT5: AKTIF ({LOT} lot, tombol konfirmasi)" if EXEC_ENABLED else "Eksekusi MT5: nonaktif (isi ALLOWED_USER_IDS)"
     await update.message.reply_text(
         "Bot sinyal forex (MT5).\n\n"
+        "/menu - pilih pair dan timeframe lewat tombol\n"
         "/signal EURUSD [tf] - minta sinyal (tf: 1m, 5m, 15m, 30m, 1h, 4h, 1d)\n"
         "/akun - info akun MT5\n"
         "/myid - lihat ID Telegram Anda\n\n"
         f"{mode}\n"
         "Bukan saran keuangan. Selalu pakai manajemen risiko."
     )
+
+
+async def menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.message.reply_text(MENU_TEXT, reply_markup=pair_keyboard())
 
 
 async def myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -218,7 +294,7 @@ async def akun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     try:
-        await update.message.reply_text(await run_sync(account_text_sync))
+        await update.message.reply_text(await run_sync(account_text_sync), reply_markup=MENU_ONLY)
     except Exception as e:
         await update.message.reply_text(f"Gagal: {e}")
 
@@ -227,7 +303,7 @@ async def signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     if not ctx.args:
-        await update.message.reply_text("Contoh: /signal EURUSD 1h")
+        await update.message.reply_text("Contoh: /signal EURUSD 1h\nAtau ketik /menu untuk pilih lewat tombol.")
         return
     pair = normalize_pair(ctx.args[0])
     tf = ctx.args[1].lower() if len(ctx.args) > 1 else DEFAULT_TF
@@ -236,32 +312,7 @@ async def signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Timeframe valid: {', '.join(TF_MAP)}")
         return
     wait = await update.message.reply_text(f"Menganalisis {pair} {tf}...")
-    markup = None
-    try:
-        s = await analyze(pair, tf)
-        text = (
-            f"📊 {pair} ({tf})\n"
-            f"Arah: {s['arah']}\n"
-            f"Entry: {s.get('entry')}\nSL: {s.get('stop_loss')}\nTP: {s.get('take_profit')}\n"
-            f"Keyakinan: {s.get('keyakinan')}%\n\n{s['alasan']}\n\n"
-            "⚠️ Bukan saran keuangan."
-        )
-        if EXEC_ENABLED and s.get("arah") in ("BUY", "SELL") and valid_levels(s):
-            key = uuid.uuid4().hex[:8]
-            pending = ctx.bot_data.setdefault("pending", {})
-            if len(pending) > 50:
-                pending.clear()
-            pending[key] = (pair, s)
-            markup = InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton(f"✅ Eksekusi {s['arah']} {LOT} lot", callback_data=f"x:{key}"),
-                    InlineKeyboardButton("❌ Batal", callback_data=f"c:{key}"),
-                ]]
-            )
-    except Exception as e:
-        logging.exception("gagal")
-        text = f"Gagal: {e}"
-    await wait.edit_text(text, reply_markup=markup)
+    await do_signal(wait, ctx, pair, tf)
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -269,27 +320,69 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not allowed(update):
         return
-    action, key = q.data.split(":", 1)
+    data = q.data or ""
+    msg = q.message
+
+    if data == "menu":
+        await msg.edit_text(MENU_TEXT, reply_markup=pair_keyboard())
+        return
+    if data.startswith("p:"):
+        pair = data[2:]
+        if pair in MENU_PAIRS:
+            await msg.edit_text(f"{pair}\nPilih timeframe:", reply_markup=tf_keyboard(pair))
+        return
+    if data.startswith("m:"):
+        parts = data.split(":")
+        if len(parts) == 3 and parts[1] in MENU_PAIRS and parts[2] in TF_MAP:
+            await msg.edit_text(f"Menganalisis {parts[1]} {parts[2]}...")
+            await do_signal(msg, ctx, parts[1], parts[2])
+        return
+    if data == "akun":
+        try:
+            text = await run_sync(account_text_sync)
+        except Exception as e:
+            text = f"Gagal: {e}"
+        await msg.edit_text(text, reply_markup=MENU_ONLY)
+        return
+
+    # Tombol eksekusi (x) dan batal (c)
+    action, _, key = data.partition(":")
+    if action not in ("x", "c"):
+        return
     item = ctx.bot_data.get("pending", {}).pop(key, None)
-    base = q.message.text or ""
+    base = msg.text or ""
     if item is None:
-        await q.edit_message_text(base + "\n\n⌛ Sinyal sudah kedaluwarsa atau sudah diproses.")
+        await msg.edit_text(base + "\n\n⌛ Sinyal sudah kedaluwarsa atau sudah diproses.", reply_markup=MENU_ONLY)
         return
     if action == "c":
-        await q.edit_message_text(base + "\n\n❌ Dibatalkan.")
+        await msg.edit_text(base + "\n\n❌ Dibatalkan.", reply_markup=MENU_ONLY)
         return
-    await q.edit_message_text(base + "\n\n⏳ Mengirim order...")
+    await msg.edit_text(base + "\n\n⏳ Mengirim order...")
     try:
         res = await run_sync(execute_order_sync, *item)
-        await q.edit_message_text(base + f"\n\n✅ Order terkirim. Tiket: {res.order}, harga: {res.price}")
+        await msg.edit_text(base + f"\n\n✅ Order terkirim. Tiket: {res.order}, harga: {res.price}", reply_markup=MENU_ONLY)
     except Exception as e:
         logging.exception("order gagal")
-        await q.edit_message_text(base + f"\n\n❌ Order gagal: {e}")
+        await msg.edit_text(base + f"\n\n❌ Order gagal: {e}", reply_markup=MENU_ONLY)
+
+
+async def post_init(app):
+    """Daftarkan perintah ke tombol Menu di Telegram."""
+    await app.bot.set_my_commands(
+        [
+            BotCommand("menu", "Pilih pair dan timeframe"),
+            BotCommand("signal", "Minta sinyal, contoh: /signal XAUUSD 15m"),
+            BotCommand("akun", "Info akun MT5"),
+            BotCommand("myid", "Lihat ID Telegram Anda"),
+            BotCommand("start", "Bantuan"),
+        ]
+    )
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("akun", akun))
     app.add_handler(CommandHandler("signal", signal))
