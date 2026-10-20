@@ -1,5 +1,5 @@
 python-telegram-bot>=21.0
 openai>=1.40.0
-httpx>=0.27
 pandas>=2.0
 python-dotenv>=1.0
+MetaTrader5
